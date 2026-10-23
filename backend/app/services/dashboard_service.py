@@ -1253,6 +1253,7 @@ async def _account_balance_at(
     cutoff: date,
     *,
     include_pending: bool = False,
+    balance_date_col=None,
 ) -> float:
     """Get balance for a single account at a specific date.
 
@@ -1262,6 +1263,8 @@ async def _account_balance_at(
     matching the bank app. Forecast callers add pending/future rows separately.
     """
     today = app_today()
+    if balance_date_col is None:
+        balance_date_col = Transaction.date
     balance_cutoff = min(cutoff, today)
     if account.connection_id:
         # Start from the provider's authoritative current balance
@@ -1282,7 +1285,7 @@ async def _account_balance_at(
             .outerjoin(Category, Transaction.category_id == Category.id)
             .where(
                 Transaction.account_id == account.id,
-                Transaction.date > cutoff,
+                balance_date_col > cutoff,
                 Transaction.date <= today,
                 Transaction.is_ignored == False,
                 *status_filter,
@@ -1322,7 +1325,7 @@ async def _account_balance_at(
             .outerjoin(Category, Transaction.category_id == Category.id)
             .where(
                 Transaction.account_id == account.id,
-                Transaction.date <= balance_cutoff,
+                balance_date_col <= balance_cutoff,
                 Transaction.is_ignored == False,
                 *status_filter,
                 or_(
@@ -1339,6 +1342,7 @@ async def _total_balance_by_currency(
     account_ids: Optional[list[uuid.UUID]] = None,
     *,
     include_pending: bool = False,
+    balance_date_col=None,
 ) -> dict[str, float]:
     """Get total balance across all open accounts at a date, grouped by currency."""
     accounts = await _get_open_accounts(session, workspace_id, account_ids)
@@ -1346,6 +1350,8 @@ async def _total_balance_by_currency(
         return {}
 
     today = app_today()
+    if balance_date_col is None:
+        balance_date_col = Transaction.date
     balance_cutoff = min(cutoff, today)
     connected = [account for account in accounts if account.connection_id]
     manual = [account for account in accounts if not account.connection_id]
@@ -1385,7 +1391,7 @@ async def _total_balance_by_currency(
 
     manual_sums = await grouped_sums(
         [account.id for account in manual],
-        Transaction.date <= balance_cutoff,
+        balance_date_col <= balance_cutoff,
         *([] if include_pending else [Transaction.status == "posted"]),
     )
 
@@ -1395,7 +1401,7 @@ async def _total_balance_by_currency(
         connected_ids = [account.id for account in connected]
         connected_deltas = await grouped_sums(
             connected_ids,
-            Transaction.date > cutoff,
+            balance_date_col > cutoff,
             Transaction.date <= today,
             *([] if include_pending else [Transaction.status == "posted"]),
         )
@@ -1432,7 +1438,8 @@ async def _total_balance_by_currency(
             # Every card in the group carries the same shared debt, so `total`
             # counts it len(group) times; strip the duplicates.
             current_shared = await _account_balance_at(
-                session, group[0], today, include_pending=include_pending
+                session, group[0], today, include_pending=include_pending,
+                balance_date_col=balance_date_col,
             )
             total -= current_shared * (len(group) - 1)
         currency = group[0].currency
@@ -1445,6 +1452,7 @@ async def _balance_at(
     *, primary_currency_hint: Optional[str] = None,
     account_ids: Optional[list[uuid.UUID]] = None,
     include_pending: bool = False,
+    balance_date_col=None,
 ) -> float:
     """Get total balance across all open accounts at a specific date, converted to primary currency.
 
@@ -1452,7 +1460,8 @@ async def _balance_at(
     already know the workspace's primary currency.
     """
     totals = await _total_balance_by_currency(
-        session, workspace_id, cutoff, account_ids, include_pending=include_pending
+        session, workspace_id, cutoff, account_ids, include_pending=include_pending,
+        balance_date_col=balance_date_col,
     )
     if not totals:
         return 0.0
@@ -1478,6 +1487,7 @@ async def _daily_balance_deltas_by_date(
     primary_currency_hint: Optional[str] = None,
     account_ids: Optional[list[uuid.UUID]] = None,
     include_pending: bool = False,
+    balance_date_col=None,
 ) -> dict[date, float]:
     """Get daily balance deltas for a date range [start, end), keyed by date.
 
@@ -1495,9 +1505,10 @@ async def _daily_balance_deltas_by_date(
         else_=-effective,
     )
     status_filter = [] if include_pending else [Transaction.status == "posted"]
+    date_col = balance_date_col if balance_date_col is not None else Transaction.date
     result = await session.execute(
         select(
-            Transaction.date,
+            date_col,
             Account.currency,
             func.sum(signed),
         )
@@ -1506,9 +1517,9 @@ async def _daily_balance_deltas_by_date(
         .where(
             Transaction.workspace_id == workspace_id,
             Account.is_closed == False,
-            Transaction.date >= start,
-            Transaction.date < end,
-            Transaction.date <= app_today(),
+            date_col >= start,
+            date_col < end,
+            date_col <= app_today(),
             Transaction.is_ignored == False,
             *status_filter,
             or_(
@@ -1517,7 +1528,7 @@ async def _daily_balance_deltas_by_date(
             ),
             *( [Transaction.account_id.in_(account_ids)] if account_ids is not None else [] ),
         )
-        .group_by(Transaction.date, Account.currency)
+        .group_by(date_col, Account.currency)
     )
 
     primary_currency = primary_currency_hint or get_settings().default_currency

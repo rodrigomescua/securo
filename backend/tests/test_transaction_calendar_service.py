@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
+from app.models.app_settings import AppSetting
 from app.models.category import Category
 from app.models.fx_rate import FxRate
 from app.models.recurring_transaction import RecurringTransaction
@@ -241,6 +242,89 @@ async def test_transaction_calendar_single_foreign_account_uses_primary_currency
     assert july_2.actual_expense == 50.0
     assert july_2.projected_expense == 0.0
     assert july_2.ending_balance == 450.0
+
+
+@pytest.mark.asyncio
+async def test_transaction_calendar_groups_card_bills_only_in_accrual_mode(
+    session: AsyncSession, test_user, test_workspace
+):
+    card = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="Card One", display_name="Travel", type="credit_card",
+        balance=Decimal("0"), currency="BRL",
+    )
+    other_card = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="Card Two", type="credit_card", balance=Decimal("0"), currency="BRL",
+    )
+    paid_card = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="Paid Card", type="credit_card", balance=Decimal("0"), currency="BRL",
+    )
+    session.add_all([card, other_card, paid_card, AppSetting(key="credit_card_accounting_mode", value="accrual")])
+    await session.flush()
+    rows = [
+        (card, "Market", 10, date(2026, 9, 2), date(2026, 10, 25)),
+        (card, "Fuel", 20, date(2026, 9, 8), date(2026, 10, 25)),
+        (other_card, "Book", 5, date(2026, 9, 9), date(2026, 10, 26)),
+        (paid_card, "Dinner", 7, date(2026, 8, 20), date(2026, 10, 15)),
+    ]
+    session.add_all([
+        Transaction(
+            id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+            account_id=account.id, description=description, amount=Decimal(amount),
+            currency="BRL", date=purchase, effective_date=due, type="debit", source="sync",
+        )
+        for account, description, amount, purchase, due in rows
+    ])
+    await session.commit()
+
+    calendar = await get_transaction_calendar(
+        session, test_workspace.id, test_user.id, month=date(2026, 10, 1)
+    )
+    due_25 = next(day for day in calendar.days if day.date == date(2026, 10, 25))
+    due_26 = next(day for day in calendar.days if day.date == date(2026, 10, 26))
+    due_15 = next(day for day in calendar.days if day.date == date(2026, 10, 15))
+    assert due_15.actual_expense == 7.0
+    assert due_15.ending_balance == -7.0
+    assert len(due_15.items) == 1
+    assert due_15.items[0].source == "credit_card_bill"
+    assert due_25.projected_expense == 30.0
+    assert due_25.ending_balance == -37.0
+    assert len(due_25.items) == 1
+    assert due_25.items[0].id is None
+    assert due_25.items[0].source == "credit_card_bill"
+    assert due_25.items[0].description == "Travel"
+    assert due_26.projected_expense == 5.0
+    assert due_26.ending_balance == -42.0
+
+
+@pytest.mark.asyncio
+async def test_transaction_calendar_cash_mode_keeps_card_purchases_on_purchase_dates(
+    session: AsyncSession, test_user, test_workspace
+):
+    card = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="Card", type="credit_card", balance=Decimal("0"), currency="BRL",
+    )
+    session.add_all([card, AppSetting(key="credit_card_accounting_mode", value="cash")])
+    await session.flush()
+    session.add(Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        account_id=card.id, description="Purchase", amount=Decimal("40"),
+        currency="BRL", date=date(2026, 10, 3), effective_date=date(2026, 10, 25),
+        type="debit", source="sync",
+    ))
+    await session.commit()
+
+    calendar = await get_transaction_calendar(
+        session, test_workspace.id, test_user.id, month=date(2026, 10, 1)
+    )
+    purchase_day = next(day for day in calendar.days if day.date == date(2026, 10, 3))
+    due_day = next(day for day in calendar.days if day.date == date(2026, 10, 25))
+    assert purchase_day.actual_expense == 40.0
+    assert purchase_day.items[0].id is not None
+    assert due_day.expense == 0.0
 
 
 @pytest.mark.asyncio

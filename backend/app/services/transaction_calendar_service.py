@@ -24,7 +24,10 @@ from app.services.dashboard_service import (
     _daily_balance_deltas_by_date,
     _get_forecast_transactions,
 )
+from app.services._query_filters import reporting_date_col
+from app.services.admin_service import get_credit_card_accounting_mode
 from app.services.fx_rate_service import convert as fx_convert
+from app.services.credit_card_service import compute_effective_date
 from app.services.recurring_transaction_service import (
     adjust_weekend_date,
     get_occurrences_in_range,
@@ -61,6 +64,8 @@ async def get_transaction_calendar(
 
     user = await session.get(User, user_id)
     primary_currency = user.primary_currency if user else get_settings().default_currency
+    accounting_mode = await get_credit_card_accounting_mode(session)
+    report_date = reporting_date_col(accounting_mode)
 
     requested_account_ids = account_ids
     if requested_account_ids is not None and len(requested_account_ids) == 0:
@@ -84,6 +89,7 @@ async def get_transaction_calendar(
         primary_currency_hint=primary_currency,
         account_ids=requested_account_ids,
         include_pending=True,
+        balance_date_col=report_date,
     )
 
     # A future calendar month starts after today's current balance. Carry real
@@ -92,7 +98,7 @@ async def get_transaction_calendar(
     if grid_start > app_today():
         before_grid_rows = await _get_forecast_transactions(
             session, workspace_id, app_today() + timedelta(days=1), grid_start,
-            requested_account_ids,
+            requested_account_ids, range_date_col=report_date,
         )
         for tx in before_grid_rows:
             if tx.is_ignored or (tx.category and tx.category.is_ignored):
@@ -102,7 +108,8 @@ async def get_transaction_calendar(
             )
 
     actual_rows = await _load_actual_transactions(
-        session, workspace_id, grid_start, grid_end, requested_account_ids
+        session, workspace_id, grid_start, grid_end, requested_account_ids,
+        range_date_col=report_date,
     )
     balance_deltas = await _daily_balance_deltas_by_date(
         session,
@@ -111,11 +118,14 @@ async def get_transaction_calendar(
         grid_end,
         primary_currency_hint=primary_currency,
         account_ids=requested_account_ids,
+        balance_date_col=report_date,
     )
+    actual_bills: dict[tuple[uuid.UUID, date, bool, bool], tuple[Transaction, float]] = {}
     for tx in actual_rows:
-        if tx.date not in days:
+        tx_date = _report_date(tx, accounting_mode)
+        if tx_date not in days:
             continue
-        day = days[tx.date]
+        day = days[tx_date]
         amount_primary = await _positive_primary_amount(
             session, tx.amount, tx.currency, primary_currency, tx.amount_primary
         )
@@ -124,6 +134,11 @@ async def get_transaction_calendar(
             tx.category and tx.category.treat_as_transfer
         )
         ignored = bool(tx.is_ignored or (tx.category and tx.category.is_ignored))
+        if accounting_mode == "accrual" and _is_card_bill_expense(tx, is_transfer):
+            key = (tx.account_id, tx_date, ignored, bool(tx.exclude_from_pnl))
+            previous = actual_bills.get(key)
+            actual_bills[key] = (tx, amount_primary + (previous[1] if previous else 0.0))
+            continue
         if not ignored and not tx.exclude_from_pnl:
             if is_transfer or tx.source == "transfer":
                 transfer_delta = await _signed_balance_delta_primary(session, tx, primary_currency)
@@ -143,14 +158,26 @@ async def get_transaction_calendar(
         day.actual_count += 1
         day.items.append(_actual_item(tx, amount_primary, is_transfer, ignored))
 
+    for (account_id, bill_date, ignored, excluded), (tx, amount) in actual_bills.items():
+        day = days[bill_date]
+        day.actual_count += 1
+        if not ignored and not excluded:
+            day.expense += amount
+            day.actual_expense += amount
+            day.has_expense = True
+        day.items.append(_bill_item(tx, bill_date, amount, primary_currency, ignored, excluded, "actual"))
+
     forecast_rows = await _get_forecast_transactions(
-        session, workspace_id, grid_start, grid_end, requested_account_ids
+        session, workspace_id, grid_start, grid_end, requested_account_ids,
+        range_date_col=report_date,
     )
     forecast_deltas: dict[date, float] = {}
+    projected_bills: dict[tuple[uuid.UUID, date, bool, bool], tuple[Transaction, float]] = {}
     for tx in forecast_rows:
-        if tx.date not in days:
+        tx_date = _report_date(tx, accounting_mode)
+        if tx_date not in days:
             continue
-        day = days[tx.date]
+        day = days[tx_date]
         amount_primary = await _positive_primary_amount(
             session, tx.amount, tx.currency, primary_currency, tx.amount_primary
         )
@@ -158,6 +185,15 @@ async def get_transaction_calendar(
             tx.category and tx.category.treat_as_transfer
         )
         ignored = bool(tx.is_ignored or (tx.category and tx.category.is_ignored))
+        if accounting_mode == "accrual" and _is_card_bill_expense(tx, is_transfer):
+            key = (tx.account_id, tx_date, ignored, bool(tx.exclude_from_pnl))
+            previous = projected_bills.get(key)
+            projected_bills[key] = (tx, amount_primary + (previous[1] if previous else 0.0))
+            if not ignored:
+                forecast_deltas[tx_date] = forecast_deltas.get(tx_date, 0.0) + await _signed_balance_delta_primary(
+                    session, tx, primary_currency
+                )
+            continue
         if not ignored and not tx.exclude_from_pnl:
             if is_transfer or tx.source == "transfer":
                 delta = await _signed_balance_delta_primary(session, tx, primary_currency)
@@ -179,9 +215,18 @@ async def get_transaction_calendar(
         # projected walk. The seed already contains forecast rows before the
         # grid; rows inside the grid are applied here.
         if not ignored:
-            forecast_deltas[tx.date] = forecast_deltas.get(tx.date, 0.0) + await _signed_balance_delta_primary(
+            forecast_deltas[tx_date] = forecast_deltas.get(tx_date, 0.0) + await _signed_balance_delta_primary(
                 session, tx, primary_currency
             )
+
+    for (account_id, bill_date, ignored, excluded), (tx, amount) in projected_bills.items():
+        day = days[bill_date]
+        day.projected_count += 1
+        if not ignored and not excluded:
+            day.expense += amount
+            day.projected_expense += amount
+            day.has_expense = True
+        day.items.append(_bill_item(tx, bill_date, amount, primary_currency, ignored, excluded, "projected"))
 
     projected_items, projected_deltas, carried_projected_delta = await _project_recurring_items(
         session,
@@ -190,6 +235,7 @@ async def get_transaction_calendar(
         grid_start,
         grid_end,
         requested_account_ids,
+        accounting_mode,
     )
     start_balance += carried_projected_delta
     for item, signed_delta in projected_items:
@@ -281,21 +327,64 @@ def _date_range(start: date, end: date):
         current += timedelta(days=1)
 
 
+def _report_date(tx: Transaction, accounting_mode: str) -> date:
+    return tx.effective_bill_date or (
+        tx.effective_date if accounting_mode == "accrual" else tx.date
+    )
+
+
+def _is_card_bill_expense(tx: Transaction, is_transfer: bool) -> bool:
+    return bool(
+        tx.account
+        and tx.account.type == "credit_card"
+        and tx.type == "debit"
+        and not is_transfer
+        and tx.source not in ("transfer", "settlement", "opening_balance")
+    )
+
+
+def _bill_item(
+    tx: Transaction,
+    bill_date: date,
+    amount_primary: float,
+    primary_currency: str,
+    ignored: bool,
+    excluded: bool,
+    kind: Literal["actual", "projected"],
+) -> TransactionCalendarItem:
+    account = tx.account
+    return TransactionCalendarItem(
+        kind=kind,
+        date=bill_date,
+        description=account.display_name or account.name if account else "",
+        amount=amount_primary,
+        amount_primary=amount_primary,
+        currency=primary_currency,
+        type="debit",
+        account_id=tx.account_id,
+        account_name=account.display_name or account.name if account else None,
+        status=None,
+        source="credit_card_bill",
+        is_ignored=ignored,
+        exclude_from_pnl=excluded,
+    )
 async def _load_actual_transactions(
     session: AsyncSession,
     workspace_id: uuid.UUID,
     start: date,
     end: date,
     account_ids: Optional[list[uuid.UUID]],
+    range_date_col=None,
 ) -> list[Transaction]:
+    bucket_date = range_date_col if range_date_col is not None else Transaction.date
     stmt = (
         select(Transaction)
         .outerjoin(Category, Transaction.category_id == Category.id)
         .where(
             Transaction.workspace_id == workspace_id,
-            Transaction.date >= start,
-            Transaction.date < end,
-            Transaction.date <= app_today(),
+            bucket_date >= start,
+            bucket_date < end,
+            bucket_date <= app_today(),
             Transaction.status == "posted",
         )
         .options(
@@ -303,7 +392,7 @@ async def _load_actual_transactions(
             selectinload(Transaction.category),
             selectinload(Transaction.payee_entity),
         )
-        .order_by(Transaction.date.asc(), Transaction.created_at.asc())
+        .order_by(bucket_date.asc(), Transaction.created_at.asc())
     )
     if account_ids is not None:
         stmt = stmt.where(Transaction.account_id.in_(account_ids))
@@ -402,19 +491,25 @@ def _forecast_item(
     )
 
 
-def _count_occurrences_before(recurring: RecurringTransaction, end: date) -> int:
+def _count_occurrences_before(
+    recurring: RecurringTransaction, end: date, card_account: Optional[Account] = None
+) -> int:
     """Count still-virtual effective occurrences before ``end`` without truncating."""
     nominal_start = recurring.next_occurrence
     first_effective = adjust_weekend_date(
         nominal_start, recurring.weekend_adjustment
     )
     range_start = min(nominal_start, first_effective)
-    range_end = end
+    # Cycle math can move a purchase to the next invoice, up to 62 days later.
+    range_end = end + timedelta(days=62) if card_account else end
     if recurring.end_date is not None:
         final_effective = adjust_weekend_date(
             recurring.end_date, recurring.weekend_adjustment
         )
-        range_end = min(range_end, final_effective + timedelta(days=1))
+        range_end = min(
+            range_end,
+            final_effective + timedelta(days=63 if card_account else 1),
+        )
 
     count = 0
     while range_start < range_end:
@@ -431,7 +526,15 @@ def _count_occurrences_before(recurring: RecurringTransaction, end: date) -> int
             intended_day=recurring.day_of_month or recurring.start_date.day,
             weekend_adjustment=recurring.weekend_adjustment,
         )
-        count += len(occurrences)
+        if card_account:
+            count += sum(
+                compute_effective_date(
+                    occurrence, card_account.statement_close_day, card_account.payment_due_day
+                ) < end
+                for occurrence in occurrences
+            )
+        else:
+            count += len(occurrences)
         range_start = chunk_end
     return count
 
@@ -443,6 +546,7 @@ async def _project_recurring_items(
     start: date,
     end: date,
     account_ids: Optional[list[uuid.UUID]],
+    accounting_mode: str,
 ) -> tuple[list[tuple[TransactionCalendarItem, float]], dict[date, float], float]:
     stmt = (
         select(RecurringTransaction)
@@ -470,17 +574,20 @@ async def _project_recurring_items(
     for rec in recurring_rows:
         if rec.account_id is None:
             continue
+        account = rec.account
+        card_accrual = bool(
+            accounting_mode == "accrual" and account and account.type == "credit_card"
+        )
         occurrences = get_occurrences_in_range(
             start=rec.next_occurrence,
             frequency=rec.frequency,
             end_date=rec.end_date,
-            range_start=start,
+            range_start=start - timedelta(days=62) if card_accrual else start,
             range_end=end,
             intended_day=rec.day_of_month or rec.start_date.day,
             weekend_adjustment=rec.weekend_adjustment,
         )
         category = rec.category
-        account = rec.account
         amount_primary = await _positive_primary_amount(
             session, rec.amount, rec.currency, primary_currency, rec.amount_primary
         )
@@ -488,8 +595,17 @@ async def _project_recurring_items(
         is_transfer = bool(category and category.treat_as_transfer)
         is_ignored = bool(category and category.is_ignored)
         if not is_ignored:
-            carried_delta += _count_occurrences_before(rec, start) * signed_delta
-        for occ_date in occurrences:
+            carried_delta += _count_occurrences_before(
+                rec, start, account if card_accrual else None
+            ) * signed_delta
+        for nominal_date in occurrences:
+            occ_date = (
+                compute_effective_date(
+                    nominal_date, account.statement_close_day, account.payment_due_day
+                ) if card_accrual and account else nominal_date
+            )
+            if occ_date < start or occ_date >= end:
+                continue
             item = TransactionCalendarItem(
                 kind="projected",
                 recurring_id=rec.id,

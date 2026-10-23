@@ -1150,7 +1150,8 @@
     "invoiceBadgeTooltip": "Ez a tranzakció egy számlát egyenlít ki. Megnyitás.",
     "suggestionBadge": "Kérdés",
     "suggestionBadgeTooltip": "Lehet, hogy egy befizetés kiegyenlíti ezt. Nyisd meg a sort a válaszhoz.",
-    "clearGroupFilter": "Csoportszűrő törlése"
+    "clearGroupFilter": "Csoportszűrő törlése",
+    "calendarCreditCardBill": "Hitelkártya-számla"
   },
   "accounts": {
     "title": "Számlák",

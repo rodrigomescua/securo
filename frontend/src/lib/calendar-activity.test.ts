@@ -132,4 +132,14 @@ describe('isCalendarItemInteractive', () => {
 
     expect(isCalendarItemInteractive(item)).toBe(false)
   })
+
+  it('keeps summarized credit card bills read-only', () => {
+    const item = {
+      kind: 'actual',
+      id: null,
+      source: 'credit_card_bill',
+    } as TransactionCalendarItem
+
+    expect(isCalendarItemInteractive(item)).toBe(false)
+  })
 })

@@ -805,7 +805,8 @@ function DayPreviewRow({
   showDescription?: boolean
 }) {
   const amount = signedAmount(item)
-  const label = [item.description, item.category_name].filter(Boolean).join(' · ')
+  const { t } = useTranslation()
+  const label = [item.source === 'credit_card_bill' ? t('transactions.calendarCreditCardBill') : item.description, item.source === 'credit_card_bill' ? item.description : null, item.category_name].filter(Boolean).join(' · ')
   return (
     <div
       title={label}
@@ -819,7 +820,7 @@ function DayPreviewRow({
       <CategoryIcon icon={item.category_icon ?? undefined} color={item.category_color ?? undefined} size="xs" />
       {showDescription && (
         <span className="min-w-0 flex-1 truncate whitespace-nowrap text-muted-foreground">
-          {previewDescription(item.description)}
+          {previewDescription(item.source === 'credit_card_bill' ? `${t('transactions.calendarCreditCardBill')} · ${item.description}` : item.description)}
         </span>
       )}
       <span
@@ -1236,7 +1237,9 @@ function CalendarItemRow({
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
-          <p className="text-sm font-semibold text-foreground truncate leading-tight">{item.description}</p>
+          <p className="text-sm font-semibold text-foreground truncate leading-tight">
+            {item.source === 'credit_card_bill' ? `${t('transactions.calendarCreditCardBill')} · ${item.description}` : item.description}
+          </p>
           {item.kind === 'projected' && item.source === 'recurring' && item.status !== 'pending' && (
             <ProjectedTransactionBadge />
           )}
@@ -1261,7 +1264,7 @@ function CalendarItemRow({
             </span>
           )}
         </div>
-        {(account || item.account_name) && (
+        {(account || item.account_name) && item.source !== 'credit_card_bill' && (
           <div className="flex items-center gap-1.5 mt-0.5">
             {account && <AccountIcon account={account} size="xs" />}
             <span className="text-xs text-muted-foreground truncate">

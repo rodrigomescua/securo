@@ -1218,7 +1218,8 @@
     "invoiceBadgeTooltip": "Tato transakce vyrovnává fakturu. Otevřete ji.",
     "suggestionBadge": "Otázka",
     "suggestionBadgeTooltip": "Platba může uhradit tuto fakturu. Otevřete frontu a odpovězte.",
-    "clearGroupFilter": "Zrušit filtr skupiny"
+    "clearGroupFilter": "Zrušit filtr skupiny",
+    "calendarCreditCardBill": "Účet kreditní karty"
   },
   "accounts": {
     "title": "Účty",
