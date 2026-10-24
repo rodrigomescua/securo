@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.app_clock import app_today
 from app.models.account import Account
-from app.models.asset import LOAN_COLLATERAL_TYPES, Asset
+from app.models.asset import ASSET_PRICE_DECIMALS, LOAN_COLLATERAL_TYPES, Asset
 from app.models.asset_transaction import AssetTransaction
 from app.models.asset_value import AssetValue
 from app.models.user import User
@@ -947,7 +947,7 @@ async def get_portfolio_trend(
 
     for d in sorted_dates:
         row: dict[str, object] = {"date": d.isoformat()}
-        date_total = 0.0
+        date_total = Decimal("0")
         for aid in [a["id"] for a in asset_meta]:
             if d in value_lookup[aid]:
                 last_known[aid] = value_lookup[aid][d]
@@ -966,15 +966,18 @@ async def get_portfolio_trend(
             currency = asset_currency[aid]
             if native != 0.0 and currency != primary_currency:
                 converted, _ = await convert(
-                    session, Decimal(str(native)), currency, primary_currency, d
+                    session, Decimal(str(native)), currency, primary_currency, d,
+                    decimals=ASSET_PRICE_DECIMALS,
                 )
-                val = round(float(converted), 2)
+                val = converted
             else:
-                val = round(native, 2)
+                val = Decimal(str(native))
 
-            row[aid] = val
+            # Each series point is shown in monetary decimals, but the total
+            # sums the unrounded values so sub-cent holdings still add up.
+            row[aid] = round(float(val), 2)
             date_total += val
-        row["_total"] = round(date_total, 2)
+        row["_total"] = float(date_total.quantize(Decimal("0.01")))
         trend.append(row)
 
     # The header total matches the last row's _total — both use the same
@@ -1042,7 +1045,8 @@ async def get_asset_values_at(
 
         if primary_currency is not None:
             converted, _ = await convert(
-                session, Decimal(str(amount)), asset.currency, primary_currency, as_of_date
+                session, Decimal(str(amount)), asset.currency, primary_currency, as_of_date,
+                decimals=ASSET_PRICE_DECIMALS,
             )
             primary_total += float(converted)
 
