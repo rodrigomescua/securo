@@ -2,14 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, customizations]
   pull_request:
     branches: [main]
 
-# Only superseded PR runs are cancelled; every main push is validated.
+# Keep the newest validation for each branch or pull request.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend-tests:

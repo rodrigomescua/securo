@@ -3,6 +3,8 @@ name: Build and Push Docker Images
 on:
   release:
     types: [published]
+  push:
+    branches: [customizations]
 
 env:
   REGISTRY: ghcr.io
@@ -11,6 +13,11 @@ env:
 permissions:
   contents: read
   packages: write
+
+# Do not spend time building images for superseded commits on the same branch.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   build-backend:
@@ -36,7 +43,8 @@ jobs:
           images: ${{ env.IMAGE_PREFIX }}/securo-backend
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/customizations' }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -76,7 +84,8 @@ jobs:
           images: ${{ env.IMAGE_PREFIX }}/securo-frontend
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/customizations' }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -91,12 +100,13 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VITE_APP_VERSION=${{ github.event.release.tag_name }}
+            VITE_APP_VERSION=${{ github.event.release.tag_name || github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   build-helm:
     needs: [build-backend, build-frontend]
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
