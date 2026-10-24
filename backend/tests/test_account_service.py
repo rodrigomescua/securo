@@ -27,6 +27,7 @@ from app.services.account_service import (
     _simplefin_to_internal_balance,
     create_account,
     close_account,
+    create_opening_balance_for_connected_account,
     delete_account,
     get_account,
     get_account_balance_history,
@@ -34,7 +35,6 @@ from app.services.account_service import (
     get_accounts,
     reopen_account,
     serialize_account,
-    sync_opening_balance_for_connected_account,
     update_account,
 )
 
@@ -1066,10 +1066,10 @@ async def test_get_account_summary_connected_excludes_future_rows_from_opening_b
 
 
 @pytest.mark.asyncio
-async def test_sync_opening_balance_ignores_future_and_ignored_rows(
+async def test_create_opening_balance_ignores_future_and_ignored_rows(
     session, test_user, test_workspace, test_connection
 ):
-    """Provider reconciliation uses only active rows dated through today."""
+    """The initial adjustment excludes ignored and future-dated rows."""
     account = await _make_account(
         session, test_user.id, "Sync Future Rows", balance="600.00",
         connection_id=test_connection.id,
@@ -1081,7 +1081,7 @@ async def test_sync_opening_balance_ignores_future_and_ignored_rows(
     ignored.is_ignored = True
     await session.commit()
 
-    await sync_opening_balance_for_connected_account(session, account)
+    await create_opening_balance_for_connected_account(session, account)
     from sqlalchemy import select
     result = await session.execute(
         select(Transaction).where(
@@ -1093,6 +1093,32 @@ async def test_sync_opening_balance_ignores_future_and_ignored_rows(
 
     assert opening.type == "credit"
     assert opening.amount == Decimal("100.00")
+
+
+@pytest.mark.asyncio
+async def test_create_opening_balance_does_not_change_existing_transaction(
+    session, test_user, test_workspace, test_connection
+):
+    account = await _make_account(
+        session, test_user.id, "Manually Adjusted", balance="600.00",
+        connection_id=test_connection.id,
+    )
+    opening_date = date.today() - timedelta(days=10)
+    opening = Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        account_id=account.id, description="Saldo inicial", amount=Decimal("432.10"),
+        currency="BRL", date=opening_date, type="credit", source="opening_balance",
+    )
+    session.add(opening)
+    await session.commit()
+
+    account.balance = Decimal("9999.00")
+    await create_opening_balance_for_connected_account(session, account)
+    await session.refresh(opening)
+
+    assert opening.amount == Decimal("432.10")
+    assert opening.date == opening_date
+    assert opening.type == "credit"
 
 
 # ---------------------------------------------------------------------------

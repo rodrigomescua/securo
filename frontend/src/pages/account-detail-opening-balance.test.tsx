@@ -24,6 +24,9 @@ const api = vi.hoisted(() => ({
   dashboard: { projectedTransactions: vi.fn() },
   categories: { list: vi.fn() },
   categoryGroups: { list: vi.fn() },
+  currencies: { list: vi.fn() },
+  payees: { list: vi.fn() },
+  rules: { list: vi.fn() },
 }))
 const viewport = vi.hoisted(() => ({ mobile: false }))
 
@@ -33,6 +36,9 @@ vi.mock('@/lib/api', () => ({
   dashboard: api.dashboard,
   categories: api.categories,
   categoryGroups: api.categoryGroups,
+  currencies: api.currencies,
+  payees: api.payees,
+  rules: api.rules,
 }))
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => viewport.mobile }))
 vi.mock('@/hooks/use-display-locale', () => ({
@@ -45,7 +51,8 @@ vi.mock('@/hooks/use-privacy-mode', () => ({
 vi.mock('@/contexts/auth-context', () => ({
   useAuth: () => ({ user: { preferences: { currency_display: 'BRL' } } }),
 }))
-vi.mock('@/contexts/workspace-context', () => ({
+vi.mock('@/contexts/workspace-context', async importOriginal => ({
+  ...await importOriginal<typeof import('@/contexts/workspace-context')>(),
   useWorkspace: () => ({ canWrite: true }),
 }))
 
@@ -98,6 +105,9 @@ beforeEach(async () => {
   api.dashboard.projectedTransactions.mockResolvedValue([])
   api.categories.list.mockResolvedValue([])
   api.categoryGroups.list.mockResolvedValue([])
+  api.currencies.list.mockResolvedValue([])
+  api.payees.list.mockResolvedValue([])
+  api.rules.list.mockResolvedValue([])
 })
 
 function description(text: string, mobile: boolean) {
@@ -143,6 +153,19 @@ describe.each([false, true])('account-detail opening-balance description (mobile
     expect(items).toEqual(originalItems) // amount, date, source and API data stay unchanged
     expect(api.transactions.update).not.toHaveBeenCalled()
     captureAsgiRender('en-restored')
+  })
+
+  it('opens the opening balance for manual editing', async () => {
+    viewport.mobile = mobile
+    renderWithProviders(<AccountDetailPage />, {
+      route: `/accounts/${account.id}`, path: '/accounts/:id',
+    })
+    await waitFor(() => expect(api.transactions.list).toHaveBeenCalled())
+    await waitFor(() => expect(description('Opening balance', mobile)).toBeVisible())
+
+    await act(async () => { description('Opening balance', mobile).click() })
+
+    expect(await screen.findByRole('dialog')).toBeVisible()
   })
 })
 

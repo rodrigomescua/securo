@@ -39,8 +39,7 @@ def _simplefin_to_internal_balance(provider: str, account_type: str, balance: De
     SimpleFIN reports a credit card's balance as negative debt and exposes no
     account type, so the provider stores it raw and labels every account
     "checking". Pluggy/Enable report card debt as a positive number, which is
-    the convention every downstream site (serialize_account, _account_balance_at,
-    sync_opening_balance_for_connected_account, ...) assumes. Flip SimpleFIN card
+    the convention expected by downstream balance calculations. Flip SimpleFIN card
     balances to match so those sites stay provider-agnostic.
     """
     if provider == "simplefin" and account_type == "credit_card":
@@ -609,21 +608,30 @@ async def _recompute_effective_dates(session: AsyncSession, account: Account) ->
         apply_effective_date(tx, account)
 
 
-async def sync_opening_balance_for_connected_account(
+async def create_opening_balance_for_connected_account(
     session: AsyncSession, account: Account
 ) -> None:
-    """Reconcile the opening_balance transaction so SUM(all txs) = account.balance.
+    """Create the initial opening_balance transaction for a connected account.
 
     Providers (Pluggy etc.) typically only return ~1 year of history, so the sum
-    of imported transactions rarely equals the account's true current balance.
-    This helper computes the missing opening balance and upserts a synthetic
-    `source='opening_balance'` transaction that closes the gap. After this runs,
-    balance_history and running-balance walks line up with the card balance.
+    of available transactions may not equal the account's current balance. This
+    creates a synthetic `source='opening_balance'` transaction for the gap once;
+    subsequent provider syncs must not overwrite a user's manual edits.
 
-    Call after adding new transactions in a sync (initial or incremental).
+    Call after importing transactions (and after provider duplicate cleanup on
+    incremental sync); once a row exists, later calls are no-ops.
     Does not commit; the caller is responsible for the transaction boundary.
     """
     if account.connection_id is None:
+        return
+
+    existing = await session.execute(
+        select(Transaction.id).where(
+            Transaction.account_id == account.id,
+            Transaction.source == "opening_balance",
+        ).limit(1)
+    )
+    if existing.scalar_one_or_none() is not None:
         return
 
     # The provider balance is a snapshot for today. Future-dated transactions
@@ -667,18 +675,8 @@ async def sync_opening_balance_for_connected_account(
 
     offset = Decimal(str(target)) - tx_sum
 
-    existing = await session.execute(
-        select(Transaction).where(
-            Transaction.account_id == account.id,
-            Transaction.source == "opening_balance",
-        )
-    )
-    existing_tx = existing.scalar_one_or_none()
-
-    # Offsets below one cent are rounding noise; drop any stale opening tx.
+    # Offsets below one cent are rounding noise; no opening row is needed.
     if abs(offset) < Decimal("0.01"):
-        if existing_tx:
-            await session.delete(existing_tx)
         return
 
     oldest_result = await session.execute(
@@ -704,26 +702,19 @@ async def sync_opening_balance_for_connected_account(
     opening_type = "credit" if offset > 0 else "debit"
     amount = abs(offset).quantize(Decimal("0.01"))
 
-    if existing_tx:
-        existing_tx.amount = amount
-        existing_tx.type = opening_type
-        existing_tx.date = opening_date
-        existing_tx.currency = account.currency
-        apply_effective_date(existing_tx, account)
-    else:
-        opening_tx = Transaction(
-            user_id=account.user_id,
-            workspace_id=account.workspace_id,
-            account_id=account.id,
-            description="Saldo inicial",
-            amount=amount,
-            currency=account.currency,
-            date=opening_date,
-            type=opening_type,
-            source="opening_balance",
-        )
-        apply_effective_date(opening_tx, account)
-        session.add(opening_tx)
+    opening_tx = Transaction(
+        user_id=account.user_id,
+        workspace_id=account.workspace_id,
+        account_id=account.id,
+        description="Saldo inicial",
+        amount=amount,
+        currency=account.currency,
+        date=opening_date,
+        type=opening_type,
+        source="opening_balance",
+    )
+    apply_effective_date(opening_tx, account)
+    session.add(opening_tx)
     await session.flush()
 
 

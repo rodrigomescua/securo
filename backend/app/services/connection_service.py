@@ -42,7 +42,7 @@ from app.services import reconciliation_service, recurring_match_service
 from app.services.text_similarity import token_overlap
 from app.services.account_service import (
     _simplefin_to_internal_balance,
-    sync_opening_balance_for_connected_account,
+    create_opening_balance_for_connected_account,
 )
 from app.services.asset_group_service import (
     _unique_default_name,
@@ -1293,11 +1293,10 @@ async def handle_oauth_callback(
                 _bank_converted_amount(txn_data, acct_currency, user_currency),
             )
 
-        # After importing the initial batch, reconcile the opening balance so
-        # that SUM(all transactions) matches the provider-reported balance. Any
-        # history that falls outside the provider's lookback window gets
+        # Create the account's one-time opening adjustment after its first
+        # import; older history outside the provider's lookback window is
         # absorbed into this synthetic transaction.
-        await sync_opening_balance_for_connected_account(session, account)
+        await create_opening_balance_for_connected_account(session, account)
 
     # Detect transfer pairs among newly synced transactions
     await detect_transfer_pairs(session, workspace_id, candidate_ids=new_tx_ids)
@@ -1687,7 +1686,7 @@ async def _cleanup_phantom_duplicates(
     session: AsyncSession,
     connection_id: uuid.UUID,
     live_external_ids: Optional[dict[uuid.UUID, set[str]]] = None,
-) -> set[uuid.UUID]:
+) -> None:
     """Delete synced transactions that are phantom duplicates.
 
     Some providers (or sandbox data) report the same payment twice with
@@ -1710,15 +1709,13 @@ async def _cleanup_phantom_duplicates(
     provider's fetch window, so this sync has no evidence about them, and they
     were already checked while they were in it.
 
-    Returns the ids of the accounts that lost a row, so the caller can
-    reconcile their opening balances against what is left.
     """
     accounts_result = await session.execute(
         select(Account.id).where(Account.connection_id == connection_id)
     )
     account_ids = [row[0] for row in accounts_result.all()]
     if not account_ids:
-        return set()
+        return
 
     unmatched_result = await session.execute(
         select(Transaction).where(
@@ -1729,7 +1726,6 @@ async def _cleanup_phantom_duplicates(
     )
     unmatched = list(unmatched_result.scalars().all())
 
-    touched: set[uuid.UUID] = set()
     for tx in unmatched:
         live = (live_external_ids or {}).get(tx.account_id)
         date_lo = tx.date - timedelta(days=1)
@@ -1758,10 +1754,7 @@ async def _cleanup_phantom_duplicates(
                 tx.original_description or tx.description,
             ) >= 0.9:
                 await session.delete(tx)
-                touched.add(tx.account_id)
                 break
-
-    return touched
 
 
 # Finance-charge `additionalInfo` strings that Pluggy emits but which would
@@ -2100,6 +2093,7 @@ async def sync_connection(
         user = await session.get(User, user_id)
         user_currency = user.primary_currency if user else get_settings().default_currency
         new_tx_ids: list[uuid.UUID] = []
+        synced_accounts: list[Account] = []
         merged_count = 0
         live_txn_external_ids: dict[uuid.UUID, set[str]] = {}
         accounts_data = await provider.get_accounts(credentials)
@@ -2233,6 +2227,8 @@ async def sync_connection(
                 )
                 session.add(account)
                 await session.flush()
+
+            synced_accounts.append(account)
 
             # Fetch the bills feed before transactions so transaction → bill
             # FK resolution happens in-memory (no N+1). Empty dict for non-CC
@@ -2509,10 +2505,6 @@ async def sync_connection(
                     session, user_id, transaction, converted
                 )
 
-            # Reconcile the opening balance after any new transactions land so
-            # SUM(all txs) keeps matching account.balance from the provider.
-            await sync_opening_balance_for_connected_account(session, account)
-
         # Detect transfer pairs among newly synced transactions
         if new_tx_ids:
             await detect_transfer_pairs(session, workspace_id, candidate_ids=new_tx_ids)
@@ -2539,24 +2531,14 @@ async def sync_connection(
         # Clean up phantom duplicates: providers occasionally double-report the
         # same payment with different ids. Once transfer detection has paired
         # the real one, the orphan twin gets removed here.
-        touched_account_ids = await _cleanup_phantom_duplicates(
+        await _cleanup_phantom_duplicates(
             session, connection.id, live_txn_external_ids
         )
 
-        # The opening balances above were reconciled with the phantoms still
-        # counted. Reconcile the open accounts that lost one again, so the
-        # removed amount does not stay behind in their synthetic opening
-        # transaction. Closed accounts stay out, as in the account loop.
-        if touched_account_ids:
-            await session.flush()
-            touched_accounts = await session.execute(
-                select(Account).where(
-                    Account.id.in_(touched_account_ids),
-                    Account.is_closed == False,
-                )
-            )
-            for touched_account in touched_accounts.scalars():
-                await sync_opening_balance_for_connected_account(session, touched_account)
+        # Create a missing opening offset after duplicate cleanup. The helper
+        # leaves any existing row untouched, including user edits.
+        for synced_account in synced_accounts:
+            await create_opening_balance_for_connected_account(session, synced_account)
 
         # Refresh investment holdings (brokerage, fixed income, funds,
         # etc.) when enabled for this connection. Errors here are logged but

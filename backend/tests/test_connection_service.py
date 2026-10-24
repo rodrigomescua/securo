@@ -862,6 +862,27 @@ async def test_sync_connection_new_transactions(session: AsyncSession, test_user
     )
     assert transaction is not None
     assert transaction.original_description == "GROCERY"
+    opening = await session.scalar(
+        select(Transaction).where(
+            Transaction.account_id == transaction.account_id,
+            Transaction.source == "opening_balance",
+        )
+    )
+    assert opening is not None
+    assert opening.amount == Decimal("2080")
+
+    # A later provider snapshot must not rewrite the opening transaction.
+    mock_provider.get_accounts.return_value[0].balance = Decimal("5000")
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider), \
+         patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
+         patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
+         patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
+        await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+
+    await session.refresh(opening)
+    account = await session.get(Account, transaction.account_id)
+    assert account.balance == Decimal("5000")
+    assert opening.amount == Decimal("2080")
 
 
 @pytest.mark.asyncio
@@ -1755,12 +1776,10 @@ async def test_sync_upserts_matching_csv_import_without_overwriting_user_fields(
 
 
 @pytest.mark.asyncio
-async def test_sync_connection_opening_balance_ignores_removed_phantom(
+async def test_sync_connection_creates_missing_opening_balance_after_phantom_cleanup(
     session: AsyncSession, test_user, test_workspace
 ):
-    """A re-keyed twin of a transfer-paired row is inserted and then removed as a
-    phantom in the same sync. The opening balance must not keep its amount.
-    """
+    """A missing offset is created once from transactions after phantom cleanup."""
     conn = await _make_connection(session, test_user.id, "Rekey Bank")
 
     account = Account(
@@ -1808,10 +1827,9 @@ async def test_sync_connection_opening_balance_ignores_removed_phantom(
     synced = [row for row in rows if row.source != "opening_balance"]
     assert [row.external_id for row in synced] == ["card-payment-old-key"]
 
-    signed_total = sum(
-        row.amount if row.type == "credit" else -row.amount for row in rows
-    )
-    assert signed_total == Decimal("1000")
+    opening = next(row for row in rows if row.source == "opening_balance")
+    assert opening.type == "credit"
+    assert opening.amount == Decimal("1700.00")
 
 
 @pytest.mark.asyncio

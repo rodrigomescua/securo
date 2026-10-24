@@ -1631,9 +1631,6 @@ export default function AccountDetailPage() {
                       showPayee
                       localizeOpeningBalance
                       onClick={(clickedTx) => {
-                        // The opening-balance row is synthetic; the desktop
-                        // table makes it non-clickable and mobile must match.
-                        if (clickedTx.source === 'opening_balance') return
                         if (!clickedTx.is_shared && canWrite) {
                           setEditingTx(clickedTx)
                           setDialogOpen(true)
@@ -1665,9 +1662,9 @@ export default function AccountDetailPage() {
                     return (
                       <tr
                         key={tx.id}
-                        className={`border-b last:border-0 transition-colors ${isOpening ? 'bg-muted/60' : (canWrite && !isVirtual) ? 'hover:bg-muted cursor-pointer' : ''} ${isVirtual ? 'opacity-80' : ''}`}
+                        className={`border-b last:border-0 transition-colors ${isOpening ? 'bg-muted/60' : ''} ${(canWrite && !isVirtual) ? 'hover:bg-muted cursor-pointer' : ''} ${isVirtual ? 'opacity-80' : ''}`}
                         onClick={() => {
-                          if (!isOpening && !isVirtual && canWrite) {
+                          if (!isVirtual && canWrite) {
                             setEditingTx(tx)
                             setDialogOpen(true)
                           }
