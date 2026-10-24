@@ -881,6 +881,7 @@ async def test_sync_connection_new_transactions(session: AsyncSession, test_user
 
     await session.refresh(opening)
     account = await session.get(Account, transaction.account_id)
+    assert account is not None
     assert account.balance == Decimal("5000")
     assert opening.amount == Decimal("2080")
 
